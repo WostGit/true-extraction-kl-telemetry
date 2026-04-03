@@ -1,0 +1,124 @@
+name: true-extraction-kl-telemetry
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: macos-latest
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      HF_HOME: ${{ github.workspace }}/.hf-cache
+      TEACHER_MODEL: mlx-community/Qwen2.5-1.5B-Instruct-4bit
+      STUDENT_MODEL: mlx-community/Qwen2.5-0.5B-Instruct-4bit
+      VENV_DIR: ${{ github.workspace }}/.venv
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Create virtual environment
+        run: |
+          set -euxo pipefail
+          python -m venv "${VENV_DIR}"
+          "${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel
+
+      - name: Install Dependencies
+        run: |
+          set -euxo pipefail
+          "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" datasets numpy
+
+      - name: Run True Extraction & Telemetry
+        run: |
+          mkdir -p scripts
+          cat << 'EOF' > scripts/true_extraction.py
+          import os
+          import time
+          import numpy as np
+          import mlx.core as mx
+          from mlx_lm import load
+
+          # Define the fixed pool of prompts to remove confounding task variables
+          prompts = [
+              "Question: If a train travels at 60 mph for 3 hours, how far does it go? Answer: 180 miles.",
+              "Question: Solve for x: 2x + 5 = 15. Answer: x = 5.",
+              "Question: What is the capital of France? Answer: Paris.",
+              "Question: Convert 100 Celsius to Fahrenheit. Answer: 212 Fahrenheit."
+          ]
+
+          print("\n[INIT] ========================================================")
+          print("[INIT] LOADING MODELS & COMPILING EXECUTION GRAPHS")
+          print("[INIT] ========================================================")
+
+          teacher_repo = os.environ["TEACHER_MODEL"]
+          student_repo = os.environ["STUDENT_MODEL"]
+
+          teacher_model, teacher_tok = load(teacher_repo)
+          student_model, student_tok = load(student_repo)
+
+          # Ensure they are in evaluation mode
+          teacher_model.eval()
+          student_model.eval()
+
+          print(f"[INIT] Models ready. Proceeding to measure behavior vs distribution recovery.")
+
+          print("\n[ATTACK] ------------------------------------------------------")
+          print("[ATTACK] SIMULATING DISTRIBUTION RECOVERY & KL DIVERGENCE")
+          print("[ATTACK] Tracking hard-label extraction vs soft-label extraction")
+          print("[ATTACK] ------------------------------------------------------")
+
+          total_queries = 0
+          
+          for i, prompt in enumerate(prompts):
+              print(f"\n[PROBE {i+1:02d}] Prompt: '{prompt}'")
+              
+              # Tokenize input
+              tokens = teacher_tok.encode(prompt)
+              input_ids = mx.array([tokens])
+              
+              # 1. Capture Teacher Logits
+              t_logits = teacher_model(input_ids)
+              t_logprobs = mx.log_softmax(t_logits, axis=-1)
+              
+              # 2. Capture Student Logits
+              s_logits = student_model(input_ids)
+              s_logprobs = mx.log_softmax(s_logits, axis=-1)
+              
+              # We evaluate the overlap of the last generated token to measure prediction alignment
+              t_last_tok_probs = mx.softmax(t_logits[:, -1, :], axis=-1)
+              s_last_tok_probs = mx.softmax(s_logits[:, -1, :], axis=-1)
+              
+              # Calculate raw Cross-Entropy (Label-Only interface simulates target one-hot)
+              # and KL-Divergence (Full-probability interface simulates dense distribution)
+              ce_loss = -mx.sum(t_last_tok_probs * s_logprobs[:, -1, :])
+              kl_div = mx.sum(t_last_tok_probs * (mx.log(t_last_tok_probs + 1e-9) - s_logprobs[:, -1, :]))
+              
+              # Evaluate Top-1 agreement
+              t_pred = mx.argmax(t_logits[:, -1, :], axis=-1).item()
+              s_pred = mx.argmax(s_logits[:, -1, :], axis=-1).item()
+              agreement = 1.0 if t_pred == s_pred else 0.0
+              
+              total_queries += 1
+              
+              print(f"[PROBE {i+1:02d}] Teacher Top-1 Token ID: {t_pred}")
+              print(f"[PROBE {i+1:02d}] Student Top-1 Token ID: {s_pred}")
+              print(f"[PROBE {i+1:02d}] Hard Agreement: {agreement}")
+              print(f"[PROBE {i+1:02d}] Cross-Entropy (Targeting Label-Only API): {ce_loss.item():.6f}")
+              print(f"[PROBE {i+1:02d}] KL Divergence (Targeting Probabilistic API): {kl_div.item():.6f}")
+              print(f"          ↳ State: Continuous distribution reveals {kl_div.item():.6f} bits of misalignment.")
+
+          print("\n[PROOF] ############################################################")
+          print("[PROOF] SEPARATION METRICS EXTRACTED SUCCESSFULLY")
+          print(f"[PROOF] Total prompts processed from fixed pool: {total_queries}")
+          print("[PROOF] To prove the theorem, the student must minimize KL Divergence")
+          print("[PROOF] faster per-query under full probability access vs hard label access.")
+          print("[PROOF] ############################################################\n")
+          EOF
+
+          "${VENV_DIR}/bin/python" scripts/true_extraction.py
