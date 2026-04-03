@@ -1,4 +1,4 @@
-name: true-extraction-kl-telemetry
+name: true-extraction-telemetry
 
 on:
   workflow_dispatch:
@@ -15,26 +15,26 @@ jobs:
       VENV_DIR: ${{ github.workspace }}/.venv
 
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Create virtual environment
+      - name: Create Python Virtual Environment
         run: |
           set -euxo pipefail
           python -m venv "${VENV_DIR}"
           "${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel
 
-      - name: Install Dependencies
+      - name: Install MLX and Dependencies
         run: |
           set -euxo pipefail
           "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" datasets numpy
 
-      - name: Run True Extraction & Telemetry
+      - name: Execute True Extraction & Telemetry
         run: |
           mkdir -p scripts
           cat << 'EOF' > scripts/true_extraction.py
@@ -44,7 +44,9 @@ jobs:
           import mlx.core as mx
           from mlx_lm import load
 
-          # Define the fixed pool of prompts to remove confounding task variables
+          # ------------------------------------------------------------
+          # PROMPT POOL DEFINITION
+          # ------------------------------------------------------------
           prompts = [
               "Question: If a train travels at 60 mph for 3 hours, how far does it go? Answer: 180 miles.",
               "Question: Solve for x: 2x + 5 = 15. Answer: x = 5.",
@@ -59,13 +61,15 @@ jobs:
           teacher_repo = os.environ["TEACHER_MODEL"]
           student_repo = os.environ["STUDENT_MODEL"]
 
+          load_start = time.time()
           teacher_model, teacher_tok = load(teacher_repo)
           student_model, student_tok = load(student_repo)
 
-          # Ensure they are in evaluation mode
+          # Put models in evaluation mode to prevent training dropout noise
           teacher_model.eval()
           student_model.eval()
 
+          print(f"[INIT] Models loaded successfully in {time.time() - load_start:.2f}s")
           print(f"[INIT] Models ready. Proceeding to measure behavior vs distribution recovery.")
 
           print("\n[ATTACK] ------------------------------------------------------")
@@ -74,51 +78,58 @@ jobs:
           print("[ATTACK] ------------------------------------------------------")
 
           total_queries = 0
-          
+
           for i, prompt in enumerate(prompts):
               print(f"\n[PROBE {i+1:02d}] Prompt: '{prompt}'")
               
-              # Tokenize input
+              # Tokenize input and convert to MLX array
               tokens = teacher_tok.encode(prompt)
               input_ids = mx.array([tokens])
               
-              # 1. Capture Teacher Logits
-              t_logits = teacher_model(input_ids)
-              t_logprobs = mx.log_softmax(t_logits, axis=-1)
+              # 1. Capture Teacher & Student Logits (Isolating the final predicted token)
+              t_logits = teacher_model(input_ids)[:, -1, :]
+              s_logits = student_model(input_ids)[:, -1, :]
               
-              # 2. Capture Student Logits
-              s_logits = student_model(input_ids)
-              s_logprobs = mx.log_softmax(s_logits, axis=-1)
+              # 2. Manual Log-Softmax via Log-Sum-Exp for numerical stability
+              # This bypasses the missing mx.log_softmax in base MLX
+              t_logsumexp = mx.logsumexp(t_logits, axis=-1, keepdims=True)
+              t_logprobs = t_logits - t_logsumexp
               
-              # We evaluate the overlap of the last generated token to measure prediction alignment
-              t_last_tok_probs = mx.softmax(t_logits[:, -1, :], axis=-1)
-              s_last_tok_probs = mx.softmax(s_logits[:, -1, :], axis=-1)
+              s_logsumexp = mx.logsumexp(s_logits, axis=-1, keepdims=True)
+              s_logprobs = s_logits - s_logsumexp
               
-              # Calculate raw Cross-Entropy (Label-Only interface simulates target one-hot)
-              # and KL-Divergence (Full-probability interface simulates dense distribution)
-              ce_loss = -mx.sum(t_last_tok_probs * s_logprobs[:, -1, :])
-              kl_div = mx.sum(t_last_tok_probs * (mx.log(t_last_tok_probs + 1e-9) - s_logprobs[:, -1, :]))
+              # 3. Softmax probabilities for expected value calculations
+              t_probs = mx.softmax(t_logits, axis=-1)
               
-              # Evaluate Top-1 agreement
-              t_pred = mx.argmax(t_logits[:, -1, :], axis=-1).item()
-              s_pred = mx.argmax(s_logits[:, -1, :], axis=-1).item()
+              # 4. Calculate Cross-Entropy (simulating target one-hot or hard-label API)
+              # Formula: -sum(P * log(Q))
+              ce_loss = -mx.sum(t_probs * s_logprobs)
+              
+              # 5. Calculate KL-Divergence (simulating full continuous score-bearing interface)
+              # Formula: sum(P * (log(P) - log(Q)))
+              kl_div = mx.sum(t_probs * (t_logprobs - s_logprobs))
+              
+              # 6. Evaluate Top-1 agreement
+              t_pred = mx.argmax(t_logits, axis=-1).item()
+              s_pred = mx.argmax(s_logits, axis=-1).item()
               agreement = 1.0 if t_pred == s_pred else 0.0
               
               total_queries += 1
               
               print(f"[PROBE {i+1:02d}] Teacher Top-1 Token ID: {t_pred}")
               print(f"[PROBE {i+1:02d}] Student Top-1 Token ID: {s_pred}")
-              print(f"[PROBE {i+1:02d}] Hard Agreement: {agreement}")
-              print(f"[PROBE {i+1:02d}] Cross-Entropy (Targeting Label-Only API): {ce_loss.item():.6f}")
-              print(f"[PROBE {i+1:02d}] KL Divergence (Targeting Probabilistic API): {kl_div.item():.6f}")
+              print(f"[PROBE {i+1:02d}] Hard Top-1 Agreement: {agreement}")
+              print(f"[PROBE {i+1:02d}] Cross-Entropy (Hard Target Interface): {ce_loss.item():.6f}")
+              print(f"[PROBE {i+1:02d}] KL Divergence (Probabilistic Interface): {kl_div.item():.6f}")
               print(f"          ↳ State: Continuous distribution reveals {kl_div.item():.6f} bits of misalignment.")
 
           print("\n[PROOF] ############################################################")
           print("[PROOF] SEPARATION METRICS EXTRACTED SUCCESSFULLY")
           print(f"[PROOF] Total prompts processed from fixed pool: {total_queries}")
-          print("[PROOF] To prove the theorem, the student must minimize KL Divergence")
-          print("[PROOF] faster per-query under full probability access vs hard label access.")
+          print("[PROOF] Ready for budget sweep parameterization.")
           print("[PROOF] ############################################################\n")
           EOF
 
+          # Execute the script via the venv Python binary
           "${VENV_DIR}/bin/python" scripts/true_extraction.py
+          shell: /bin/bash -e {0}
